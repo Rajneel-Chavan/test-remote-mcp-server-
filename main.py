@@ -1,16 +1,13 @@
 from fastmcp import FastMCP
 import os
+import sqlite3
 import aiosqlite
 import json
-from datetime import datetime, date
-from typing import Optional
+import tempfile
+from datetime import date
 
-# ── For remote deployment use persistent path
-# ── For local development use file directory
-DB_PATH = os.environ.get(
-    "DB_PATH",
-    os.path.join(os.path.dirname(__file__), "expenses.db")
-)
+TEMP_DIR = tempfile.gettempdir()
+DB_PATH = os.path.join(TEMP_DIR, "expenses.db")
 CATEGORIES_PATH = os.path.join(
     os.path.dirname(__file__), "categories.json"
 )
@@ -19,12 +16,12 @@ print(f"Database path: {DB_PATH}")
 
 mcp = FastMCP("ExpenseTracker Pro")
 
+
 # -------------------
 # DB INIT (sync — runs once at startup)
 # -------------------
 def init_db():
     try:
-        import sqlite3
         with sqlite3.connect(DB_PATH) as c:
             c.execute("PRAGMA journal_mode=WAL")
             c.execute("""
@@ -69,16 +66,22 @@ def init_db():
                     active INTEGER DEFAULT 1
                 )
             """)
-            print("Database initialized successfully")
+            # Test write access
+            c.execute(
+                "INSERT OR IGNORE INTO expenses"
+                "(date, amount, category) VALUES ('2000-01-01', 0, 'test')"
+            )
+            c.execute("DELETE FROM expenses WHERE category = 'test'")
+            print("Database initialized successfully with write access")
     except Exception as e:
-        print(f"DB init error: {e}")
+        print(f"Database initialization error: {e}")
         raise
 
 init_db()
 
 
 # -------------------
-# EXPENSE TOOLS (async)
+# EXPENSE TOOLS
 # -------------------
 
 @mcp.tool()
@@ -110,10 +113,10 @@ async def add_expense(
             return {
                 "status": "success",
                 "id": expense_id,
-                "message": f"Added ₹{amount} for {category}"
+                "message": f"Added {amount} for {category}"
             }
     except Exception as e:
-        return {"status": "error", "message": str(e)}
+        return {"status": "error", "message": f"Database error: {str(e)}"}
 
 
 @mcp.tool()
@@ -126,7 +129,7 @@ async def list_expenses(
 ) -> list:
     """
     List expenses within date range.
-    Filter by category or payment_mode optionally.
+    Optionally filter by category or payment_mode.
     """
     try:
         async with aiosqlite.connect(DB_PATH) as c:
@@ -143,15 +146,13 @@ async def list_expenses(
             if payment_mode:
                 query += " AND payment_mode = ?"
                 params.append(payment_mode)
-            query += " ORDER BY date DESC LIMIT ?"
+            query += " ORDER BY date DESC, id DESC LIMIT ?"
             params.append(limit)
-
             cur = await c.execute(query, params)
             cols = [d[0] for d in cur.description]
-            rows = await cur.fetchall()
-            return [dict(zip(cols, r)) for r in rows]
+            return [dict(zip(cols, r)) for r in await cur.fetchall()]
     except Exception as e:
-        return {"status": "error", "message": str(e)}
+        return {"status": "error", "message": f"Error listing expenses: {str(e)}"}
 
 
 @mcp.tool()
@@ -174,10 +175,8 @@ async def update_expense(
         if val is not None:
             updates.append(f"{field} = ?")
             values.append(val)
-
     if not updates:
         return {"status": "error", "message": "No fields provided"}
-
     values.append(expense_id)
     try:
         async with aiosqlite.connect(DB_PATH) as c:
@@ -190,7 +189,7 @@ async def update_expense(
                 return {"status": "error", "message": "Expense not found"}
             return {"status": "success", "updated_id": expense_id}
     except Exception as e:
-        return {"status": "error", "message": str(e)}
+        return {"status": "error", "message": f"Database error: {str(e)}"}
 
 
 @mcp.tool()
@@ -199,22 +198,18 @@ async def delete_expense(expense_id: int) -> dict:
     try:
         async with aiosqlite.connect(DB_PATH) as c:
             cur = await c.execute(
-                "DELETE FROM expenses WHERE id = ?",
-                (expense_id,)
+                "DELETE FROM expenses WHERE id = ?", (expense_id,)
             )
             await c.commit()
             if cur.rowcount == 0:
-                return {"status": "error", "message": "Not found"}
+                return {"status": "error", "message": "Expense not found"}
             return {"status": "success", "deleted_id": expense_id}
     except Exception as e:
-        return {"status": "error", "message": str(e)}
+        return {"status": "error", "message": f"Database error: {str(e)}"}
 
 
 @mcp.tool()
-async def search_expenses(
-    keyword: str,
-    limit: int = 20
-) -> list:
+async def search_expenses(keyword: str, limit: int = 20) -> list:
     """Search expenses by keyword in note, category, subcategory."""
     try:
         async with aiosqlite.connect(DB_PATH) as c:
@@ -229,10 +224,9 @@ async def search_expenses(
                  f"%{keyword}%", limit)
             )
             cols = [d[0] for d in cur.description]
-            rows = await cur.fetchall()
-            return [dict(zip(cols, r)) for r in rows]
+            return [dict(zip(cols, r)) for r in await cur.fetchall()]
     except Exception as e:
-        return {"status": "error", "message": str(e)}
+        return {"status": "error", "message": f"Error searching: {str(e)}"}
 
 
 # -------------------
@@ -245,13 +239,13 @@ async def summarize(
     end_date: str,
     category: str = None
 ) -> list:
-    """Summarize expenses by category with stats."""
+    """Summarize expenses by category with full stats."""
     try:
         async with aiosqlite.connect(DB_PATH) as c:
             query = """
                 SELECT category,
                        COUNT(*) as transactions,
-                       SUM(amount) as total_amount,
+                       SUM(amount) AS total_amount,
                        AVG(amount) as avg_amount,
                        MIN(amount) as min_amount,
                        MAX(amount) as max_amount
@@ -263,21 +257,20 @@ async def summarize(
                 query += " AND category = ?"
                 params.append(category)
             query += " GROUP BY category ORDER BY total_amount DESC"
-
             cur = await c.execute(query, params)
             cols = [d[0] for d in cur.description]
-            rows = await cur.fetchall()
-            return [dict(zip(cols, r)) for r in rows]
+            return [dict(zip(cols, r)) for r in await cur.fetchall()]
     except Exception as e:
-        return {"status": "error", "message": str(e)}
+        return {"status": "error", "message": f"Error summarizing: {str(e)}"}
 
 
 @mcp.tool()
 async def monthly_summary(year: int, month: int) -> dict:
     """
-    Complete monthly P&L — expenses, income,
-    net savings, savings rate, top 5 expenses,
-    category breakdown, payment mode breakdown.
+    Complete monthly P&L report.
+    Total expenses, income, net savings,
+    savings rate, category breakdown,
+    top 5 expenses, payment mode breakdown.
     """
     start = f"{year}-{month:02d}-01"
     end = f"{year}-{month+1:02d}-01" if month < 12 \
@@ -343,7 +336,7 @@ async def monthly_summary(year: int, month: int) -> dict:
             ]
         }
     except Exception as e:
-        return {"status": "error", "message": str(e)}
+        return {"status": "error", "message": f"Error in monthly summary: {str(e)}"}
 
 
 @mcp.tool()
@@ -362,10 +355,9 @@ async def spending_trend(months: int = 6) -> list:
                 (months,)
             )
             cols = [d[0] for d in cur.description]
-            rows = await cur.fetchall()
-            return [dict(zip(cols, r)) for r in rows]
+            return [dict(zip(cols, r)) for r in await cur.fetchall()]
     except Exception as e:
-        return {"status": "error", "message": str(e)}
+        return {"status": "error", "message": f"Error in spending trend: {str(e)}"}
 
 
 @mcp.tool()
@@ -389,31 +381,29 @@ async def top_spending_categories(
                 (start_date, end_date, top_n)
             )
             cols = [d[0] for d in cur.description]
-            rows = await cur.fetchall()
-            return [dict(zip(cols, r)) for r in rows]
+            return [dict(zip(cols, r)) for r in await cur.fetchall()]
     except Exception as e:
-        return {"status": "error", "message": str(e)}
+        return {"status": "error", "message": f"Error: {str(e)}"}
 
 
 @mcp.tool()
-async def daily_average(
-    start_date: str,
-    end_date: str
-) -> dict:
+async def daily_average(start_date: str, end_date: str) -> dict:
     """Average daily spending in a period."""
     try:
         async with aiosqlite.connect(DB_PATH) as c:
-            total = (await (await c.execute(
+            total_row = await (await c.execute(
                 "SELECT COALESCE(SUM(amount),0) FROM expenses "
                 "WHERE date BETWEEN ? AND ?",
                 (start_date, end_date)
-            )).fetchone())[0]
+            )).fetchone()
+            total = total_row[0]
 
-            days = (await (await c.execute(
+            days_row = await (await c.execute(
                 "SELECT COUNT(DISTINCT date) FROM expenses "
                 "WHERE date BETWEEN ? AND ?",
                 (start_date, end_date)
-            )).fetchone())[0]
+            )).fetchone()
+            days = days_row[0]
 
         avg = total / days if days > 0 else 0
         return {
@@ -423,7 +413,7 @@ async def daily_average(
             "daily_average": round(avg, 2)
         }
     except Exception as e:
-        return {"status": "error", "message": str(e)}
+        return {"status": "error", "message": f"Error: {str(e)}"}
 
 
 @mcp.tool()
@@ -431,20 +421,22 @@ async def net_worth_snapshot(
     start_date: str,
     end_date: str
 ) -> dict:
-    """Total income vs expenses = net position."""
+    """Total income vs expenses net position."""
     try:
         async with aiosqlite.connect(DB_PATH) as c:
-            exp = (await (await c.execute(
+            exp_row = await (await c.execute(
                 "SELECT COALESCE(SUM(amount),0) FROM expenses "
                 "WHERE date BETWEEN ? AND ?",
                 (start_date, end_date)
-            )).fetchone())[0]
+            )).fetchone()
+            exp = exp_row[0]
 
-            cred = (await (await c.execute(
+            cred_row = await (await c.execute(
                 "SELECT COALESCE(SUM(amount),0) FROM credits "
                 "WHERE date BETWEEN ? AND ?",
                 (start_date, end_date)
-            )).fetchone())[0]
+            )).fetchone()
+            cred = cred_row[0]
 
         return {
             "period": f"{start_date} to {end_date}",
@@ -454,7 +446,7 @@ async def net_worth_snapshot(
             "status": "surplus" if cred >= exp else "deficit"
         }
     except Exception as e:
-        return {"status": "error", "message": str(e)}
+        return {"status": "error", "message": f"Error: {str(e)}"}
 
 
 # -------------------
@@ -479,14 +471,11 @@ async def add_credit(
             await c.commit()
             return {"status": "success", "credit_id": cur.lastrowid}
     except Exception as e:
-        return {"status": "error", "message": str(e)}
+        return {"status": "error", "message": f"Database error: {str(e)}"}
 
 
 @mcp.tool()
-async def list_credits(
-    start_date: str,
-    end_date: str
-) -> list:
+async def list_credits(start_date: str, end_date: str) -> list:
     """List all income entries within date range."""
     try:
         async with aiosqlite.connect(DB_PATH) as c:
@@ -497,10 +486,9 @@ async def list_credits(
                 (start_date, end_date)
             )
             cols = [d[0] for d in cur.description]
-            rows = await cur.fetchall()
-            return [dict(zip(cols, r)) for r in rows]
+            return [dict(zip(cols, r)) for r in await cur.fetchall()]
     except Exception as e:
-        return {"status": "error", "message": str(e)}
+        return {"status": "error", "message": f"Error: {str(e)}"}
 
 
 # -------------------
@@ -508,10 +496,7 @@ async def list_credits(
 # -------------------
 
 @mcp.tool()
-async def set_budget(
-    category: str,
-    monthly_limit: float
-) -> dict:
+async def set_budget(category: str, monthly_limit: float) -> dict:
     """Set or update monthly budget for a category."""
     try:
         async with aiosqlite.connect(DB_PATH) as c:
@@ -519,7 +504,8 @@ async def set_budget(
                 """INSERT INTO budgets(category, monthly_limit)
                    VALUES (?,?)
                    ON CONFLICT(category)
-                   DO UPDATE SET monthly_limit=excluded.monthly_limit""",
+                   DO UPDATE SET
+                   monthly_limit=excluded.monthly_limit""",
                 (category, monthly_limit)
             )
             await c.commit()
@@ -529,7 +515,7 @@ async def set_budget(
                 "monthly_limit": monthly_limit
             }
     except Exception as e:
-        return {"status": "error", "message": str(e)}
+        return {"status": "error", "message": f"Database error: {str(e)}"}
 
 
 @mcp.tool()
@@ -570,7 +556,7 @@ async def check_budget(year: int, month: int) -> list:
                 })
             return results
     except Exception as e:
-        return {"status": "error", "message": str(e)}
+        return {"status": "error", "message": f"Error: {str(e)}"}
 
 
 # -------------------
@@ -587,7 +573,7 @@ async def add_recurring(
     note: str = ""
 ) -> dict:
     """
-    Add recurring expense.
+    Add a recurring expense.
     frequency: daily | weekly | monthly | yearly
     next_due: YYYY-MM-DD
     """
@@ -595,8 +581,8 @@ async def add_recurring(
         async with aiosqlite.connect(DB_PATH) as c:
             cur = await c.execute(
                 """INSERT INTO recurring
-                   (amount,category,subcategory,note,
-                    frequency,next_due)
+                   (amount, category, subcategory,
+                    note, frequency, next_due)
                    VALUES (?,?,?,?,?,?)""",
                 (amount, category, subcategory,
                  note, frequency, next_due)
@@ -604,7 +590,7 @@ async def add_recurring(
             await c.commit()
             return {"status": "success", "id": cur.lastrowid}
     except Exception as e:
-        return {"status": "error", "message": str(e)}
+        return {"status": "error", "message": f"Database error: {str(e)}"}
 
 
 @mcp.tool()
@@ -618,10 +604,9 @@ async def list_recurring(active_only: bool = True) -> list:
             query += " ORDER BY next_due ASC"
             cur = await c.execute(query)
             cols = [d[0] for d in cur.description]
-            rows = await cur.fetchall()
-            return [dict(zip(cols, r)) for r in rows]
+            return [dict(zip(cols, r)) for r in await cur.fetchall()]
     except Exception as e:
-        return {"status": "error", "message": str(e)}
+        return {"status": "error", "message": f"Error: {str(e)}"}
 
 
 @mcp.tool()
@@ -639,10 +624,9 @@ async def due_reminders() -> list:
                 (today,)
             )
             cols = [d[0] for d in cur.description]
-            rows = await cur.fetchall()
-            return [dict(zip(cols, r)) for r in rows]
+            return [dict(zip(cols, r)) for r in await cur.fetchall()]
     except Exception as e:
-        return {"status": "error", "message": str(e)}
+        return {"status": "error", "message": f"Error: {str(e)}"}
 
 
 # -------------------
@@ -654,8 +638,8 @@ async def due_reminders() -> list:
     mime_type="application/json"
 )
 def categories():
-    """Live expense categories from JSON."""
-    default = {
+    """Live expense categories from JSON file."""
+    default_categories = {
         "categories": [
             "Food & Dining", "Transportation",
             "Shopping", "Entertainment",
@@ -667,7 +651,10 @@ def categories():
         with open(CATEGORIES_PATH, "r", encoding="utf-8") as f:
             return f.read()
     except FileNotFoundError:
-        return json.dumps(default, indent=2)
+        import json
+        return json.dumps(default_categories, indent=2)
+    except Exception as e:
+        return f'{{"error": "Could not load categories: {str(e)}"}}'
 
 
 @mcp.resource(
@@ -676,23 +663,23 @@ def categories():
 )
 def today_summary():
     """Live today's expense summary."""
-    import sqlite3 as sqlite_sync
-    today = date.today().isoformat()
+    import json as json_mod
+    today_str = date.today().isoformat()
     try:
-        with sqlite_sync.connect(DB_PATH) as c:
+        with sqlite3.connect(DB_PATH) as c:
             rows = c.execute(
                 """SELECT category, SUM(amount) as total
                    FROM expenses WHERE date = ?
                    GROUP BY category""",
-                (today,)
+                (today_str,)
             ).fetchall()
             total = c.execute(
-                "SELECT COALESCE(SUM(amount),0) FROM expenses "
-                "WHERE date = ?",
-                (today,)
+                "SELECT COALESCE(SUM(amount),0) "
+                "FROM expenses WHERE date = ?",
+                (today_str,)
             ).fetchone()[0]
-        return json.dumps({
-            "date": today,
+        return json_mod.dumps({
+            "date": today_str,
             "total_spent_today": round(total, 2),
             "by_category": [
                 {"category": r[0], "total": round(r[1], 2)}
@@ -700,25 +687,13 @@ def today_summary():
             ]
         })
     except Exception as e:
-        return json.dumps({"error": str(e)})
+        return f'{{"error": "{str(e)}"}}'
 
 
 # -------------------
-# RUN — LOCAL or REMOTE
+# RUN
 # -------------------
 
 if __name__ == "__main__":
-    import sys
-
-    # Pass "remote" as argument to run as HTTP server
-    # python server.py remote → deploys on port 8000
-    # python server.py        → runs locally via STDIO
-
-    if len(sys.argv) > 1 and sys.argv[1] == "remote":
-        print("Starting REMOTE MCP server on port 8000...")
-        mcp.run(transport="streamable-http",
-                host="0.0.0.0",
-                port=8000)
-    else:
-        print("Starting LOCAL MCP server via STDIO...")
-        mcp.run()
+    mcp.run(transport="http", host="0.0.0.0", port=8000)
+    # mcp.run()  # uncomment for local STDIO
