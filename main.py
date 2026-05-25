@@ -17,10 +17,7 @@ CATEGORIES_PATH = os.path.join(
 
 print(f"Database path: {DB_PATH}")
 
-mcp = FastMCP(
-    "ExpenseTracker Pro",
-    dependencies=["aiosqlite"]
-)
+mcp = FastMCP("ExpenseTracker Pro")
 
 # -------------------
 # DB INIT (sync — runs once at startup)
